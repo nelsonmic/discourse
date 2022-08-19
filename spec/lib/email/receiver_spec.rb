@@ -373,6 +373,12 @@ RSpec.describe Email::Receiver do
       expect(IncomingEmail.last.created_via).to eq(IncomingEmail.created_via_types[:imap])
     end
 
+    it "stores the message_id of the incoming email against the post as outbound_message_id" do
+      process(:text_reply, source: :handle_mail)
+      message_id = IncomingEmail.last.message_id
+      expect(Post.last.outbound_message_id).to eq(message_id)
+    end
+
     it "automatically elides gmail quotes" do
       SiteSetting.always_show_trimmed_content = true
       expect { process(:gmail_html_reply) }.to change { topic.posts.count }
@@ -898,6 +904,12 @@ RSpec.describe Email::Receiver do
       expect { process(:cc) }.to raise_error(Email::Receiver::TooManyRecipientsError)
     end
 
+    it "uses the incoming_email message-id as the new post's outbound_message_id" do
+      expect { process(:cc) }.to change(Topic, :count)
+      message_id = IncomingEmail.last.message_id
+      expect(Topic.last.first_post.outbound_message_id).to eq(message_id)
+    end
+
     describe "reply-to header" do
       before do
         SiteSetting.block_auto_generated_emails = false
@@ -977,7 +989,7 @@ RSpec.describe Email::Receiver do
         expect { process(:email_reply_4) }.to change { topic.posts.count }.by(1)
       end
 
-      describe "replying with various message-id formats" do
+      describe "replying with various message-id formats using In-Reply-To header" do
         let!(:topic) do
           process(:email_reply_1)
           Topic.last
@@ -1019,6 +1031,11 @@ RSpec.describe Email::Receiver do
 
         it "posts a reply using a message-id in the format topic/TOPIC_ID.RANDOM_SUFFIX@HOST" do
           expect { process_mail_with_message_id("topic/#{topic.id}/#{post.id}.x3487nxy877843x@test.localhost") }.to change { Post.count }.by(1)
+          expect(topic.reload.posts.last.raw).to include("This is email reply testing with Message-ID formats")
+        end
+
+        it "posts a reply using a message-id in the format discourse/post/POST_ID@HOST" do
+          expect { process_mail_with_message_id("discourse/post/#{post.id}@test.localhost") }.to change { Post.count }.by(1)
           expect(topic.reload.posts.last.raw).to include("This is email reply testing with Message-ID formats")
         end
       end

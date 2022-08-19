@@ -122,50 +122,10 @@ module Email
 
         add_attachments(post)
 
-        # If the topic was created from an incoming email, then the Message-ID from
-        # that email will be the canonical reference, otherwise the canonical reference
-        # will be <topic/TOPIC_ID@host>. The canonical reference is used in the
-        # References header.
-        #
-        # This is so the sender of the original email still gets their nice threading
-        # maintained (because their mail client will initiate threading based on
-        # the Message-ID it generated) in the case where there is an incoming email.
-        #
-        # In the latter case, everyone will start their thread with the canonical reference,
-        # because we send it in the References header for all emails.
-        topic_canonical_reference_id = Email::MessageIdService.generate_for_topic(
-          topic, canonical: true, use_incoming_email_if_present: true
-        )
-
-        referenced_posts = Post.includes(:incoming_email)
-          .joins("INNER JOIN post_replies ON post_replies.post_id = posts.id ")
-          .where("post_replies.reply_post_id = ?", post_id)
-          .order(id: :desc)
-
-        referenced_post_message_ids = referenced_posts.map do |referenced_post|
-          if referenced_post.incoming_email&.message_id.present?
-            "<#{referenced_post.incoming_email.message_id}>"
-          else
-            if referenced_post.post_number == 1
-              topic_canonical_reference_id
-            else
-              Email::MessageIdService.generate_for_post(referenced_post)
-            end
-          end
-        end
-
-        # See https://www.ietf.org/rfc/rfc2822.txt for the message format
-        # specification, more useful information can be found in Email::MessageIdService
-        #
-        # The References header is how mail clients handle threading. The Message-ID
-        # must always be unique.
-        if post.post_number == 1
-          @message.header['Message-ID']  = Email::MessageIdService.generate_for_topic(topic)
-          @message.header['References']  = [topic_canonical_reference_id]
+        if SiteSetting.enable_experimental_email_message_id_generation
+          add_experimental_identification_field_headers(topic, post)
         else
-          @message.header['Message-ID']  = Email::MessageIdService.generate_for_post(post)
-          @message.header['In-Reply-To'] = referenced_post_message_ids[0] || topic_canonical_reference_id
-          @message.header['References']  = [topic_canonical_reference_id, referenced_post_message_ids].flatten.compact.uniq
+          add_identification_field_headers(topic, post)
         end
 
         # See https://www.ietf.org/rfc/rfc2919.txt for the List-ID
@@ -513,6 +473,168 @@ module Email
 
     def self.bounce_address(bounce_key)
       SiteSetting.reply_by_email_address.sub("%{reply_key}", "verp-#{bounce_key}")
+    end
+
+    def add_identification_field_headers(topic, post)
+      # If the topic was created from an incoming email, then the Message-ID from
+      # that email will be the canonical reference, otherwise the canonical reference
+      # will be <topic/TOPIC_ID@host>. The canonical reference is used in the
+      # References header.
+      #
+      # This is so the sender of the original email still gets their nice threading
+      # maintained (because their mail client will initiate threading based on
+      # the Message-ID it generated) in the case where there is an incoming email.
+      #
+      # In the latter case, everyone will start their thread with the canonical reference,
+      # because we send it in the References header for all emails.
+      topic_canonical_reference_id = Email::MessageIdService.generate_for_topic(
+        topic, canonical: true, use_incoming_email_if_present: true
+      )
+
+      # Whenever we reply to a post directly _or_ quote a post, a PostReply
+      # record is made, with the reply_post_id referencing the newly created
+      # post, and the post_id referencing the post that was quoted or replied to.
+      referenced_posts = Post.includes(:incoming_email)
+        .joins("INNER JOIN post_replies ON post_replies.post_id = posts.id ")
+        .where("post_replies.reply_post_id = ?", post.id)
+        .order(id: :desc)
+
+      referenced_post_message_ids = referenced_posts.map do |referenced_post|
+        if referenced_post.incoming_email&.message_id.present?
+          "<#{referenced_post.incoming_email.message_id}>"
+        else
+          if referenced_post.post_number == 1
+            topic_canonical_reference_id
+          else
+            Email::MessageIdService.generate_for_post(referenced_post)
+          end
+        end
+      end
+
+      # See https://www.ietf.org/rfc/rfc2822.txt for the message format
+      # specification, more useful information can be found in Email::MessageIdService
+      #
+      # The References header is how mail clients handle threading. The Message-ID
+      # must always be unique.
+      if post.post_number == 1
+        @message.header['Message-ID']  = Email::MessageIdService.generate_for_topic(topic)
+        @message.header['References']  = [topic_canonical_reference_id]
+      else
+        @message.header['Message-ID']  = Email::MessageIdService.generate_for_post(post)
+        @message.header['In-Reply-To'] = referenced_post_message_ids[0] || topic_canonical_reference_id
+        @message.header['References']  = [topic_canonical_reference_id, referenced_post_message_ids].flatten.compact.uniq
+      end
+    end
+
+    ##
+    # When sending an email for the first post (OP) of the topic, we do not
+    # set References or In-Reply-To headers, since there is nothing yet
+    # to reference. This counts as the first email in the thread.
+    #
+    # Once set, the post's `outbound_message_id` should _always_ be used
+    # when sending emails relating to a particular post to maintain threading.
+    # This will either be:
+    #
+    # a) A Message-ID generated in an external main client or service which
+    #    is recorded when creating a post from an IncomingEmail via Email::Receiver
+    # b) A Message-ID generated by Discourse and recorded when sending an email
+    #    for a newly created post, which is created and saved here to the
+    #    outbound_message_id column on the Post, to survive moves of that
+    #    posts between topics.
+    #
+    # The RFC that covers using "Identification Fields", which are References,
+    # In-Reply-To, Message-ID, et. al. can be found here. It's a good idea to read
+    # this beginning in the area immediately after these quotes, at least to understand
+    # the 3 main headers:
+    #
+    # > The "Message-ID:" field provides a unique message identifier that
+    # > refers to a particular version of a particular message.  The
+    # > uniqueness of the message identifier is guaranteed by the host that
+    # > generates it.
+    #
+    # > ...
+    #
+    # > The "In-Reply-To:" field may be used to identify the message (or
+    # > messages) to which the new message is a reply, while the "References:"
+    # > field may be used to identify a "thread" of conversation.
+    #
+    # https://www.rfc-editor.org/rfc/rfc5322.html#section-3.6.4
+    #
+    # It is a long read, but to understand the decision making process here
+    # you can take a look at:
+    #
+    # https://meta.discourse.org/t/discourse-email-messages-are-incorrectly-threaded/233499
+    def add_experimental_identification_field_headers(topic, post)
+      @message.header["Message-ID"] = Email::MessageIdService.generate_or_use_existing(post)
+
+      if post.post_number > 1
+        op_message_id = Email::MessageIdService.generate_or_use_existing(topic.first_post)
+
+        ##
+        # Whenever we reply to a post directly _or_ quote a post, a PostReply
+        # record is made, with the reply_post_id referencing the newly created
+        # post, and the post_id referencing the post that was quoted or replied to.
+        referenced_posts = Post.includes(:incoming_email)
+          .joins("INNER JOIN post_replies ON post_replies.post_id = posts.id ")
+          .where("post_replies.reply_post_id = ?", post.id)
+          .order(id: :desc)
+
+        ##
+        # No referenced posts means that we are just creating a new post not
+        # referring to anything, and as such we should just fall back to using
+        # the OP.
+        if referenced_posts.empty?
+          @message.header["In-Reply-To"] = op_message_id
+          @message.header["References"] = op_message_id
+        else
+          ##
+          # When referencing _multiple_ posts then we just choose the most recent one
+          # to use for In-Reply-To and References, then also include that post's reply
+          # parents in References as well.
+          most_recent_post = referenced_posts.first
+          most_recent_post_message_id = Email::MessageIdService.generate_or_use_existing(most_recent_post)
+          @message.header["In-Reply-To"] = most_recent_post_message_id
+
+          ##
+          # The RFC specifically states that the content of the parent's References
+          # field (in our case a tree of replies based on the PostReply table in
+          # addition to the OP post's Message-ID) first, _then_ the parent's
+          # Message-ID (in our case the outbound_message_id of the post we are replying to).
+          #
+          # This creates a thread from the OP all the way down to the most recent post we
+          # are replying to.
+          reply_tree = referenced_post_reply_tree(most_recent_post)
+          parent_message_ids = MessageIdService.generate_or_use_existing_bulk(reply_tree.values.flatten)
+
+          @message.header["References"] = [
+            op_message_id, parent_message_ids, most_recent_post_message_id
+          ].flatten.uniq
+        end
+      end
+    end
+
+    def referenced_post_reply_tree(post)
+      results = DB.query(<<~SQL, start_post_id: post.id)
+        WITH RECURSIVE cte AS (
+          SELECT reply_post_id, post_id FROM post_replies
+          WHERE reply_post_id = :start_post_id
+          UNION
+          SELECT pr.reply_post_id, pr.post_id
+          FROM post_replies pr
+          INNER JOIN cte c
+          ON c.post_id = pr.reply_post_id
+        )
+        SELECT DISTINCT cte.*, posts.created_at, posts.outbound_message_id
+        FROM cte
+        INNER JOIN posts ON posts.id = cte.reply_post_id
+        ORDER BY posts.created_at DESC, post_id DESC;
+      SQL
+      results.inject({}) do |hash, value|
+        # We only want to get a single replied-to post, which is the most recently
+        # created post, since we cannot deal with multiple parents for References
+        hash[value.reply_post_id] ||= [value.post_id]
+        hash
+      end
     end
   end
 end
